@@ -89,7 +89,6 @@ USER REQUEST:
                 "Gemini returned invalid JSON."
             ) from exc
 
-    # Keep these if you want OpenAI support later.
 
     def _generate_openai(
         self,
