@@ -135,44 +135,5 @@ USER REQUEST:
 
         return json.loads(content)
 
-    def _generate_anthropic(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> dict[str, Any]:
-
-        if not settings.anthropic_api_key:
-            raise ValueError(
-                "ANTHROPIC_API_KEY is not configured."
-            )
-
-        from anthropic import Anthropic
-
-        client = Anthropic(
-            api_key=settings.anthropic_api_key
-        )
-
-        response = client.messages.create(
-            model="claude-3-5-haiku-latest",
-            max_tokens=1000,
-            temperature=0,
-            system=system_prompt,
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                }
-            ],
-        )
-
-        content = response.content[0].text
-
-        if not content:
-            raise ValueError(
-                "Anthropic returned an empty response."
-            )
-
-        return json.loads(content)
-
-
+    
 llm_service = LLMService()
