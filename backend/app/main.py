@@ -5,6 +5,7 @@ from app.config import get_settings
 from app.database import Base, engine
 from app.models import TwinProfile
 from app.routers import profile_router
+from app.routers import simulate
 
 settings = get_settings()
 
@@ -27,6 +28,7 @@ app.add_middleware(
 )
 
 app.include_router(profile_router)
+app.include_router(simulate.router)
 
 
 @app.get("/")
