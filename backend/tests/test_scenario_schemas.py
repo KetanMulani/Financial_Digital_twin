@@ -215,3 +215,54 @@ def test_unknown_fields_are_rejected():
                 "random_field": "should not be accepted",
             }
         )
+
+
+def test_purchase_valid():
+    scenario = PurchaseScenario(
+        type="purchase",
+        start_month=1,
+        price=1_000_000,
+        down_payment=200_000,
+        financed_amount=800_000,
+        interest_rate=9,
+        duration_months=60,
+    )
+
+    assert scenario.price == 1_000_000
+
+
+def test_financed_purchase_requires_interest_rate():
+    with pytest.raises(ValidationError):
+        PurchaseScenario(
+            type="purchase",
+            start_month=1,
+            price=1_000_000,
+            down_payment=200_000,
+            financed_amount=800_000,
+            duration_months=60,
+        )
+
+
+def test_financed_purchase_requires_duration():
+    with pytest.raises(ValidationError):
+        PurchaseScenario(
+            type="purchase",
+            start_month=1,
+            price=1_000_000,
+            down_payment=200_000,
+            financed_amount=800_000,
+            interest_rate=9,
+        )
+
+
+def test_cash_purchase_does_not_require_financing_details():
+    scenario = PurchaseScenario(
+        type="purchase",
+        start_month=1,
+        price=500_000,
+        down_payment=500_000,
+        financed_amount=0,
+    )
+
+    assert scenario.interest_rate is None
+    assert scenario.duration_months is None
