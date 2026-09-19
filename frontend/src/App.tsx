@@ -29,7 +29,8 @@ function MainApp() {
 }
 
 function Shell() {
-  const { view } = useAppState();
+  const { view, checkingProfile } = useAppState();
+  if (checkingProfile) return <Loading />;
   if (view === "onboarding") return <Onboarding />;
   return <MainApp />;
 }
