@@ -8,33 +8,38 @@ import { useAppState } from "@/state/AppState";
 const TOTAL_STEPS = 5;
 
 export function Onboarding() {
-  const { profile, setProfile, completeOnboarding, go } = useAppState();
+  const { profile, goalName, setGoalName, completeOnboarding, onboardingError, go } = useAppState();
   const [step, setStep] = React.useState(1);
+  const [saving, setSaving] = React.useState(false);
   const [form, setForm] = React.useState({
-    income: String(profile.income),
-    expenses: String(profile.expenses),
-    savings: String(profile.savings),
-    debt: String(profile.debt),
-    investments: String(profile.investments),
-    emergencyFund: String(profile.emergencyFund),
-    goalName: profile.goalName,
-    goalAmount: String(profile.goalAmount),
+    income: String(profile.monthly_income || ""),
+    expenses: String(profile.monthly_expenses || ""),
+    savings: String(profile.monthly_investment || ""),
+    debt: String(profile.existing_debt || ""),
+    investments: String(profile.investments || ""),
+    emergencyFund: String(profile.cash_savings || ""),
+    goalName,
+    goalAmount: String(profile.financial_goal || ""),
   });
 
   const num = (s: string) => parseInt(s.replace(/[^\d]/g, ""), 10) || 0;
 
-  const finish = () => {
-    setProfile({
-      income: num(form.income),
-      expenses: num(form.expenses),
-      savings: num(form.savings),
-      debt: num(form.debt),
+  const finish = async () => {
+    setSaving(true);
+    const goalAmount = num(form.goalAmount);
+    setGoalName(form.goalName || "Buy a home");
+    await completeOnboarding({
+      monthly_income: num(form.income),
+      monthly_expenses: num(form.expenses),
+      monthly_investment: num(form.savings),
+      existing_debt: num(form.debt),
+      debt_interest_rate: 0,
+      monthly_debt_payment: 0,
       investments: num(form.investments),
-      emergencyFund: num(form.emergencyFund),
-      goalName: form.goalName || "Buy a home",
-      goalAmount: num(form.goalAmount),
+      cash_savings: num(form.emergencyFund),
+      financial_goal: goalAmount > 0 ? goalAmount : null,
     });
-    completeOnboarding();
+    setSaving(false);
   };
 
   const next = () => (step < TOTAL_STEPS ? setStep(step + 1) : finish());
@@ -105,10 +110,10 @@ export function Onboarding() {
                 GETTING TO KNOW YOU
               </div>
               <h2 className="font-display text-[22px] font-semibold mb-[26px]">
-                Savings and any existing debt?
+                Investing and any existing debt?
               </h2>
               <div className="grid grid-cols-2 gap-3.5 max-[480px]:grid-cols-1">
-                {field("Monthly savings", "savings", "15,000")}
+                {field("Amount you invest monthly", "savings", "15,000")}
                 {field("Existing debt", "debt", "2,10,000")}
               </div>
             </div>
@@ -146,6 +151,9 @@ export function Onboarding() {
                 />
               </div>
               {field("Target amount", "goalAmount", "10,00,000")}
+              {onboardingError && (
+                <p className="text-[12.5px] text-neg mt-1">{onboardingError}</p>
+              )}
             </div>
           )}
 
@@ -153,8 +161,8 @@ export function Onboarding() {
             <Button variant="ghost" onClick={back} style={{ visibility: step === 1 ? "hidden" : "visible" }}>
               ← Back
             </Button>
-            <Button variant="primary" onClick={next}>
-              {step === TOTAL_STEPS ? "Create my Twin" : "Continue"}
+            <Button variant="primary" onClick={next} disabled={saving}>
+              {saving ? "Saving…" : step === TOTAL_STEPS ? "Create my Twin" : "Continue"}
             </Button>
           </div>
         </Card>

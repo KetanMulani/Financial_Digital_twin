@@ -11,16 +11,20 @@ function fmtFull(n: number) {
 
 export function TwinProfile() {
   const { profile } = useAppState();
-  const savingsRate = profile.income ? ((profile.savings / profile.income) * 100).toFixed(2) : "0";
-  const emergencyMonths = profile.expenses ? (profile.emergencyFund / profile.expenses).toFixed(1) : "0";
+  const investmentRate = profile.monthly_income
+    ? ((profile.monthly_investment / profile.monthly_income) * 100).toFixed(2)
+    : "0";
+  const emergencyMonths = profile.monthly_expenses
+    ? (profile.cash_savings / profile.monthly_expenses).toFixed(1)
+    : "0";
 
   const items = [
-    { icon: <Landmark size={16} />, label: "MONTHLY INCOME", value: fmtFull(profile.income), note: "Take-home, after tax" },
-    { icon: <List size={16} />, label: "MONTHLY EXPENSES", value: fmtFull(profile.expenses), note: "Rent, bills, food & more" },
-    { icon: <PiggyBank size={16} />, label: "MONTHLY SAVINGS", value: fmtFull(profile.savings), note: `${savingsRate}% of income` },
-    { icon: <ArrowLeftRight size={16} />, label: "EXISTING DEBT", value: fmtLakh(profile.debt), note: "No active loan EMI" },
+    { icon: <Landmark size={16} />, label: "MONTHLY INCOME", value: fmtFull(profile.monthly_income), note: "Take-home, after tax" },
+    { icon: <List size={16} />, label: "MONTHLY EXPENSES", value: fmtFull(profile.monthly_expenses), note: "Rent, bills, food & more" },
+    { icon: <PiggyBank size={16} />, label: "MONTHLY INVESTMENT", value: fmtFull(profile.monthly_investment), note: `${investmentRate}% of income` },
+    { icon: <ArrowLeftRight size={16} />, label: "EXISTING DEBT", value: fmtLakh(profile.existing_debt), note: profile.monthly_debt_payment ? `${fmtFull(profile.monthly_debt_payment)}/mo EMI` : "No active EMI" },
     { icon: <TrendingUp size={16} />, label: "INVESTMENTS", value: fmtLakh(profile.investments), note: "Across mutual funds & equity" },
-    { icon: <Shield size={16} />, label: "EMERGENCY FUND", value: fmtLakh(profile.emergencyFund), note: `Covers ${emergencyMonths} months` },
+    { icon: <Shield size={16} />, label: "EMERGENCY FUND", value: fmtLakh(profile.cash_savings), note: `Covers ${emergencyMonths} months` },
   ];
 
   return (

@@ -5,11 +5,43 @@ import { Slider } from "@/components/ui/slider";
 import { useAppState } from "@/state/AppState";
 import { scenarios, formatFieldValue } from "@/data/scenarios";
 import type { ScenarioField } from "@/types";
+import type { Scenario } from "@/services/types";
+
+function buildScenario(
+  key: string,
+  fields: ScenarioField[],
+  monthlyInvestment: number
+): { scenario: Scenario; assumptions?: { annual_investment_return: number } } {
+  const value = (fieldKey: string) => fields.find((f) => f.key === fieldKey)?.value ?? 0;
+
+  if (key === "invest") {
+    return {
+      scenario: {
+        type: "investment_change",
+        new_monthly_contribution: monthlyInvestment + value("amount"),
+        start_month: 1,
+      },
+      assumptions: { annual_investment_return: value("rate") },
+    };
+  }
+
+  // "loan" and "car" both borrow a lump sum on a fixed schedule.
+  return {
+    scenario: {
+      type: "loan",
+      amount: value("amount"),
+      interest_rate: value("rate"),
+      duration_months: Math.round(value("years") * 12),
+      start_month: 1,
+    },
+  };
+}
 
 export function ScenarioBuilder() {
-  const { currentScenarioKey, go, runSimulation } = useAppState();
+  const { currentScenarioKey, profile, go, runScenarioSimulation, simulationError } = useAppState();
   const base = scenarios[currentScenarioKey];
   const [fields, setFields] = React.useState<ScenarioField[]>(() => base.fields.map((f) => ({ ...f })));
+  const [submitting, setSubmitting] = React.useState(false);
 
   React.useEffect(() => {
     setFields(scenarios[currentScenarioKey].fields.map((f) => ({ ...f })));
@@ -17,6 +49,17 @@ export function ScenarioBuilder() {
 
   const updateField = (key: string, value: number) => {
     setFields((prev) => prev.map((f) => (f.key === key ? { ...f, value } : f)));
+  };
+
+  const simulate = async () => {
+    setSubmitting(true);
+    const { scenario, assumptions } = buildScenario(
+      currentScenarioKey,
+      fields,
+      profile.monthly_investment
+    );
+    await runScenarioSimulation(currentScenarioKey, scenario, assumptions);
+    setSubmitting(false);
   };
 
   return (
@@ -49,12 +92,15 @@ export function ScenarioBuilder() {
             </div>
           ))}
         </div>
+        {simulationError && (
+          <p className="text-[13px] text-neg mb-4">{simulationError}</p>
+        )}
         <div className="flex gap-3 mt-8">
           <Button variant="ghost" className="flex-1" onClick={() => go("home")}>
             Cancel
           </Button>
-          <Button variant="primary" className="flex-1" onClick={runSimulation}>
-            Simulate Future →
+          <Button variant="primary" className="flex-1" onClick={simulate} disabled={submitting}>
+            {submitting ? "Simulating…" : "Simulate Future →"}
           </Button>
         </div>
       </Card>

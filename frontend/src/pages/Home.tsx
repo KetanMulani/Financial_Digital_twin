@@ -3,6 +3,8 @@ import { Card } from "@/components/ui/card";
 import { Gauge } from "@/components/Gauge";
 import { useAppState } from "@/state/AppState";
 import { Search, ArrowRight } from "lucide-react";
+import { parseScenario } from "@/services/api";
+import type { Scenario } from "@/services/types";
 
 function fmtLakh(n: number) {
   return "₹" + (n / 100000).toFixed(1).replace(".0", "") + "L";
@@ -21,9 +23,11 @@ function fmtTime(d: Date) {
 }
 
 export function Home() {
-  const { profile, openScenario, go } = useAppState();
+  const { profile, openScenario, runScenarioSimulation, go } = useAppState();
   const [now, setNow] = React.useState(new Date());
   const [ask, setAsk] = React.useState("");
+  const [asking, setAsking] = React.useState(false);
+  const [askNote, setAskNote] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 30000);
@@ -33,19 +37,38 @@ export function Home() {
   const hour = now.getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
 
-  const surplus = profile.income - profile.expenses;
-  const netWorth = profile.investments + profile.savings;
+  const surplus = profile.monthly_income - profile.monthly_expenses;
+  const netWorth = profile.investments + profile.cash_savings - profile.existing_debt;
 
-  const send = () => {
-    let key = "loan";
-    if (/invest/i.test(ask)) key = "invest";
-    else if (/car/i.test(ask)) key = "car";
-    else if (/loan/i.test(ask)) key = "loan";
-    openScenario(key);
+  const send = async () => {
+    if (!ask.trim() || asking) return;
+    setAsking(true);
+    setAskNote(null);
+
+    try {
+      const parsed = await parseScenario(ask);
+
+      if (parsed.requires_clarification) {
+        setAskNote(
+          parsed.missing_fields.length
+            ? `I need a bit more detail: ${parsed.missing_fields.join(", ")}.`
+            : "I need a bit more detail to run that simulation."
+        );
+        return;
+      }
+
+      const scenario = parsed.scenario as Scenario;
+      await runScenarioSimulation(scenario.type, scenario);
+    } catch (error) {
+      setAskNote(error instanceof Error ? error.message : "Couldn't parse that scenario.");
+    } finally {
+      setAsking(false);
+    }
   };
 
   const askAndGo = (text: string, key: string) => {
     setAsk(text);
+    setAskNote(null);
     setTimeout(() => openScenario(key), 250);
   };
 
@@ -72,7 +95,6 @@ export function Home() {
               <div className="text-[10.5px] tracking-[0.14em] text-text-faint font-display mb-2">NET WORTH</div>
               <div className="font-display text-[26px] font-bold tabular-nums">{fmtLakh(netWorth)}</div>
             </div>
-            <div className="text-[12.5px] text-[#8fe3d4] mt-1.5">↗ +₹44K projected</div>
           </div>
           <div className="flex items-center justify-between py-4 border-b border-line">
             <div>
@@ -83,12 +105,8 @@ export function Home() {
           </div>
           <div className="flex items-center justify-between py-4 pb-0.5">
             <div>
-              <div className="text-[10.5px] tracking-[0.14em] text-text-faint font-display mb-2">RISK EXPOSURE</div>
-              <div className="font-display text-[26px] font-bold tabular-nums">31</div>
-            </div>
-            <div className="text-[12.5px] text-text-dim mt-1.5 flex items-center gap-1">
-              <span className="text-[10.5px] font-bold tracking-wide text-accent bg-accent-soft px-1.5 py-px rounded">LOW</span>
-              Safe tolerance band
+              <div className="text-[10.5px] tracking-[0.14em] text-text-faint font-display mb-2">EXISTING DEBT</div>
+              <div className="font-display text-[26px] font-bold tabular-nums">{fmtLakh(profile.existing_debt)}</div>
             </div>
           </div>
         </div>
@@ -104,15 +122,20 @@ export function Home() {
             value={ask}
             onChange={(e) => setAsk(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && send()}
+            disabled={asking}
           />
           <button
             aria-label="Send"
             onClick={send}
-            className="w-[42px] h-[42px] rounded-full flex-shrink-0 bg-accent border-none cursor-pointer flex items-center justify-center shadow-[0_0_18px_1px_rgba(45,212,200,0.35)] hover:scale-[1.06] transition-transform"
+            disabled={asking}
+            className="w-[42px] h-[42px] rounded-full flex-shrink-0 bg-accent border-none cursor-pointer flex items-center justify-center shadow-[0_0_18px_1px_rgba(45,212,200,0.35)] hover:scale-[1.06] transition-transform disabled:opacity-50"
           >
             <ArrowRight size={16} className="text-[#06110f]" />
           </button>
         </div>
+        {askNote && (
+          <p className="text-[13px] text-text-dim mt-3 max-w-[520px] mx-auto">{askNote}</p>
+        )}
         <div className="flex flex-wrap justify-center gap-2.5 mt-5 max-[480px]:flex-col max-[480px]:items-stretch">
           <button
             className="inline-flex items-center justify-center gap-1.5 text-[13px] text-text-dim border border-line bg-white/[0.015] px-4 py-2 rounded-full cursor-pointer hover:text-text hover:border-accent/35 hover:bg-accent-soft transition-colors"
@@ -140,9 +163,13 @@ export function Home() {
           <div className="flex items-center gap-1.5 text-[11.5px] text-accent font-semibold mb-2">
             ✨ YOUR TWIN NOTICED
           </div>
-          <p className="text-[14.5px] font-semibold m-0 mb-1">Your savings rate improved by 4% this month.</p>
+          <p className="text-[14.5px] font-semibold m-0 mb-1">Your monthly surplus is {fmtK(surplus)}.</p>
           <p className="text-[12.5px] text-text-dim m-0">
-            Emergency buffer now covers <b className="text-text">5.8 months</b> of fixed expenses.
+            Emergency buffer covers{" "}
+            <b className="text-text">
+              {profile.monthly_expenses ? (profile.cash_savings / profile.monthly_expenses).toFixed(1) : "0"}
+            </b>{" "}
+            months of expenses.
           </p>
         </div>
         <button
