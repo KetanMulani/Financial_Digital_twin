@@ -1,7 +1,17 @@
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
 
-from app.services.scenario_service import parse_scenario
+from app.schemas.scenario_parse import (
+    ScenarioParseRequest,
+    ScenarioParseResponse,
+)
+from app.services.llm_service import (
+    LLMConfigurationError,
+    LLMProviderError,
+)
+from app.services.scenario_service import (
+    ScenarioParserError,
+    parse_scenario,
+)
 
 
 router = APIRouter(
@@ -10,26 +20,30 @@ router = APIRouter(
 )
 
 
-class ScenarioParseRequest(BaseModel):
-    query: str
-
-
 @router.post(
     "/parse",
+    response_model=ScenarioParseResponse,
     summary="Parse a natural-language financial scenario",
 )
-def parse_scenario_endpoint(request: ScenarioParseRequest):
+def parse_scenario_endpoint(
+    request: ScenarioParseRequest,
+) -> ScenarioParseResponse:
     try:
-        return parse_scenario(request.query)
-
-    except ValueError as exc:
+        result = parse_scenario(request.query)
+    except LLMConfigurationError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
-        )
-
-    except Exception as exc:
+        ) from exc
+    except LLMProviderError as exc:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Scenario parsing failed: {exc}",
-        )
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+    except ScenarioParserError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+
+    return ScenarioParseResponse.model_validate(result)
