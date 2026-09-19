@@ -1,483 +1,508 @@
-# backend/app/simulation/engine.py
-
 from dataclasses import dataclass
-from typing import Optional
+from typing import Protocol
+
+from app.schemas.scenario import Scenario
+from app.schemas.simulation import SimulationAssumptions
+from app.simulation.scenario_effects import (
+    ScenarioEffect,
+    apply_recurring_effect,
+    get_scenario_effect,
+)
 
 
-# ============================================================
-# DATA MODELS
-# ============================================================
+class ProfileLike(Protocol):
+    """
+    Fields required by the simulation engine.
 
-@dataclass
-class FinancialProfile:
+    The SQLAlchemy TwinProfile model already provides
+    these attributes.
+    """
+
     monthly_income: float
     monthly_expenses: float
-    savings: float
+    cash_savings: float
     investments: float
     monthly_investment: float
-    existing_debt: float = 0.0
+
+    existing_debt: float
+    debt_interest_rate: float
+    monthly_debt_payment: float
+
+    financial_goal: float | None
 
 
 @dataclass
-class LoanScenario:
-    amount: float
-    interest_rate: float
-    duration_months: int
+class DebtPosition:
+    """
+    One independently tracked debt.
 
+    Existing debt and newly created scenario debts
+    must not be merged because they may have different
+    interest rates and monthly payments.
+    """
 
-# ============================================================
-# FINANCIAL CALCULATIONS
-# ============================================================
+    balance: float
+    annual_interest_rate: float
+    monthly_payment: float
+    source: str
+
 
 def calculate_emi(
     principal: float,
     annual_interest_rate: float,
-    duration_months: int
+    duration_months: int,
 ) -> float:
     """
-    Calculate monthly EMI for a loan.
+    Calculate the fixed monthly EMI.
     """
 
     if principal <= 0:
         return 0.0
 
     if duration_months <= 0:
-        raise ValueError("Loan duration must be greater than 0")
+        raise ValueError(
+            "Loan duration must be greater than zero."
+        )
 
-    monthly_rate = annual_interest_rate / 100 / 12
+    monthly_rate = (
+        annual_interest_rate / 100 / 12
+    )
 
-    # Zero-interest loan
     if monthly_rate == 0:
         return principal / duration_months
 
-    emi = (
+    growth_factor = (
+        1 + monthly_rate
+    ) ** duration_months
+
+    return (
         principal
         * monthly_rate
-        * (1 + monthly_rate) ** duration_months
-        / (
-            (1 + monthly_rate) ** duration_months - 1
-        )
+        * growth_factor
+        / (growth_factor - 1)
     )
 
-    return emi
+
+def annual_percentage_to_monthly_rate(
+    annual_percentage: float,
+) -> float:
+    """
+    Convert an effective annual percentage to an
+    equivalent effective monthly rate.
+    """
+
+    return (
+        1 + annual_percentage / 100
+    ) ** (1 / 12) - 1
 
 
-# ============================================================
-# BASELINE SIMULATION
-# ============================================================
+def process_debt_payment(
+    debt: DebtPosition,
+) -> tuple[float, float]:
+    """
+    Accrue one month of interest and apply one payment.
 
-def simulate_baseline(
-    profile: FinancialProfile,
-    months: int = 60,
-    annual_investment_return: float = 0.10,
-    annual_inflation: float = 0.05
+    Returns:
+        payment made
+        interest portion paid
+    """
+
+    if debt.balance <= 0:
+        return 0.0, 0.0
+
+    monthly_rate = (
+        debt.annual_interest_rate / 100 / 12
+    )
+
+    interest_charged = (
+        debt.balance * monthly_rate
+    )
+
+    total_amount_due = (
+        debt.balance + interest_charged
+    )
+
+    payment = min(
+        debt.monthly_payment,
+        total_amount_due,
+    )
+
+    interest_paid = min(
+        payment,
+        interest_charged,
+    )
+
+    debt.balance = max(
+        0.0,
+        total_amount_due - payment,
+    )
+
+    return payment, interest_paid
+
+
+def round_money(value: float) -> float:
+    return round(float(value), 2)
+
+
+def project_finances(
+    *,
+    profile: ProfileLike,
+    assumptions: SimulationAssumptions,
+    projection_months: int,
+    scenario: Scenario | None = None,
 ) -> dict:
     """
-    Simulate the user's financial situation without
-    applying any new scenario.
+    Run one deterministic financial projection.
+
+    The same function is used for both the baseline
+    and scenario projections.
     """
 
-    savings = profile.savings
-    investments = profile.investments
-    debt = profile.existing_debt
-
-    monthly_return = annual_investment_return / 12
-    monthly_inflation = annual_inflation / 12
-
-    results = []
-
-    for month in range(1, months + 1):
-
-        # Inflation-adjusted expenses
-        expenses = (
-            profile.monthly_expenses
-            * (1 + monthly_inflation) ** (month - 1)
+    if projection_months < 1:
+        raise ValueError(
+            "projection_months must be at least 1."
         )
 
-        # Investment growth
-        investment_growth = investments * monthly_return
-        investments += investment_growth
+    cash = float(profile.cash_savings)
+    investments = float(profile.investments)
 
-        # Monthly investment contribution
-        investments += profile.monthly_investment
+    scenario_assets = 0.0
+    unfunded_deficit = 0.0
 
-        # Monthly cash flow
-        cash_flow = (
-            profile.monthly_income
-            - expenses
-            - profile.monthly_investment
+    debts: list[DebtPosition] = []
+
+    # Track the user's existing debt independently.
+    if profile.existing_debt > 0:
+        debts.append(
+            DebtPosition(
+                balance=float(
+                    profile.existing_debt
+                ),
+                annual_interest_rate=float(
+                    profile.debt_interest_rate
+                ),
+                monthly_payment=float(
+                    profile.monthly_debt_payment
+                ),
+                source="existing_debt",
+            )
         )
 
-        savings += cash_flow
-
-        # Net worth
-        net_worth = savings + investments - debt
-
-        results.append({
-            "month": month,
-            "income": round(profile.monthly_income, 2),
-            "expenses": round(expenses, 2),
-            "cash_flow": round(cash_flow, 2),
-            "savings": round(savings, 2),
-            "investments": round(investments, 2),
-            "debt": round(debt, 2),
-            "net_worth": round(net_worth, 2)
-        })
-
-    return {
-        "type": "baseline",
-        "months": months,
-        "results": results,
-        "final_savings": round(savings, 2),
-        "final_investments": round(investments, 2),
-        "final_debt": round(debt, 2),
-        "final_net_worth": round(
-            savings + investments - debt,
-            2
+    monthly_income_growth = (
+        annual_percentage_to_monthly_rate(
+            assumptions.annual_income_growth_rate
         )
-    }
-
-
-# ============================================================
-# LOAN SCENARIO
-# ============================================================
-
-def simulate_loan(
-    profile: FinancialProfile,
-    scenario: LoanScenario,
-    months: int = 60,
-    annual_investment_return: float = 0.10,
-    annual_inflation: float = 0.05
-) -> dict:
-    """
-    Simulate financial impact of taking a new loan.
-    """
-
-    savings = profile.savings
-    investments = profile.investments
-
-    # New loan added to existing debt
-    debt = profile.existing_debt + scenario.amount
-
-    emi = calculate_emi(
-        scenario.amount,
-        scenario.interest_rate,
-        scenario.duration_months
     )
 
-    monthly_loan_rate = (
-        scenario.interest_rate / 100 / 12
+    monthly_expense_inflation = (
+        annual_percentage_to_monthly_rate(
+            assumptions
+            .annual_expense_inflation_rate
+        )
     )
 
-    monthly_return = annual_investment_return / 12
-    monthly_inflation = annual_inflation / 12
-
-    results = []
-
-    total_interest = 0.0
-
-    for month in range(1, months + 1):
-
-        # -----------------------------------------
-        # Expenses
-        # -----------------------------------------
-
-        expenses = (
-            profile.monthly_expenses
-            * (1 + monthly_inflation) ** (month - 1)
+    monthly_investment_return = (
+        annual_percentage_to_monthly_rate(
+            assumptions.annual_investment_return
         )
+    )
 
-        # -----------------------------------------
-        # Investment growth
-        # -----------------------------------------
+    monthly_savings_interest = (
+        annual_percentage_to_monthly_rate(
+            assumptions
+            .annual_savings_interest_rate
+        )
+    )
 
-        investment_growth = investments * monthly_return
-        investments += investment_growth
+    timeline: list[dict] = []
 
-        # -----------------------------------------
-        # Loan calculation
-        # -----------------------------------------
+    total_debt_payments = 0.0
+    total_interest_paid = 0.0
 
-        loan_payment = 0.0
-        interest_payment = 0.0
-        principal_payment = 0.0
-
-        if month <= scenario.duration_months and debt > 0:
-
-            interest_payment = debt * monthly_loan_rate
-
-            principal_payment = emi - interest_payment
-
-            # Prevent overpayment in final month
-            principal_payment = min(
-                principal_payment,
-                debt
-            )
-
-            loan_payment = (
-                interest_payment + principal_payment
-            )
-
-            debt -= principal_payment
-
-            total_interest += interest_payment
-
-        # -----------------------------------------
-        # Investment contribution
-        # -----------------------------------------
-
-        investments += profile.monthly_investment
-
-        # -----------------------------------------
-        # Cash flow
-        # -----------------------------------------
-
-        cash_flow = (
+    for month in range(
+        1,
+        projection_months + 1,
+    ):
+        # Apply normal income growth.
+        base_income = (
             profile.monthly_income
-            - expenses
-            - loan_payment
-            - profile.monthly_investment
+            * (
+                1 + monthly_income_growth
+            ) ** (month - 1)
         )
 
-        savings += cash_flow
+        # Apply normal expense inflation.
+        base_expenses = (
+            profile.monthly_expenses
+            * (
+                1 + monthly_expense_inflation
+            ) ** (month - 1)
+        )
 
-        # -----------------------------------------
-        # Net worth
-        # -----------------------------------------
+        # Calculate scenario effects for this month.
+        if scenario is None:
+            effect = ScenarioEffect()
+        else:
+            effect = get_scenario_effect(
+                scenario=scenario,
+                month=month,
+                base_income=base_income,
+                base_expenses=base_expenses,
+            )
 
+        effective_values = apply_recurring_effect(
+            effect=effect,
+            base_income=base_income,
+            base_expenses=base_expenses,
+            base_monthly_investment=(
+                profile.monthly_investment
+            ),
+        )
+
+        # Existing balances earn their monthly returns.
+        cash *= (
+            1 + monthly_savings_interest
+        )
+
+        investments *= (
+            1 + monthly_investment_return
+        )
+
+        # Apply one-time scenario effects.
+        cash += effect.cash_delta
+        scenario_assets += effect.asset_delta
+
+        # A large down payment must not make cash
+        # silently negative.
+        if cash < 0:
+            unfunded_deficit += -cash
+            cash = 0.0
+
+        # Add a newly created loan or financed purchase.
+        if effect.new_debt is not None:
+            monthly_payment = calculate_emi(
+                principal=(
+                    effect.new_debt.principal
+                ),
+                annual_interest_rate=(
+                    effect.new_debt.interest_rate
+                ),
+                duration_months=(
+                    effect.new_debt.duration_months
+                ),
+            )
+
+            debts.append(
+                DebtPosition(
+                    balance=(
+                        effect.new_debt.principal
+                    ),
+                    annual_interest_rate=(
+                        effect.new_debt.interest_rate
+                    ),
+                    monthly_payment=monthly_payment,
+                    source=effect.new_debt.source,
+                )
+            )
+
+        debt_payment = 0.0
+        interest_paid = 0.0
+
+        # Each debt has its own rate and payment.
+        for debt in debts:
+            payment, paid_interest = (
+                process_debt_payment(debt)
+            )
+
+            debt_payment += payment
+            interest_paid += paid_interest
+
+        total_debt_payments += debt_payment
+        total_interest_paid += interest_paid
+
+        # The planned contribution enters investments.
+        investment_contribution = (
+            effective_values.monthly_investment
+        )
+
+        investments += investment_contribution
+
+        monthly_surplus = (
+            effective_values.income
+            - effective_values.expenses
+            - investment_contribution
+            - debt_payment
+        )
+
+        if monthly_surplus >= 0:
+            cash += monthly_surplus
+
+        else:
+            cash_required = -monthly_surplus
+
+            cash_used = min(
+                cash,
+                cash_required,
+            )
+
+            cash -= cash_used
+
+            unfunded_deficit += (
+                cash_required - cash_used
+            )
+
+        remaining_debt = sum(
+            debt.balance
+            for debt in debts
+        )
+
+        # Unfunded deficit is treated as an additional
+        # liability so that it does not falsely improve
+        # the user's net worth.
         net_worth = (
-            savings
+            cash
             + investments
-            - debt
+            + scenario_assets
+            - remaining_debt
+            - unfunded_deficit
         )
 
-        results.append({
-            "month": month,
-            "income": round(profile.monthly_income, 2),
-            "expenses": round(expenses, 2),
-            "loan_payment": round(loan_payment, 2),
-            "interest_payment": round(
-                interest_payment, 2
-            ),
-            "principal_payment": round(
-                principal_payment, 2
-            ),
-            "cash_flow": round(cash_flow, 2),
-            "savings": round(savings, 2),
-            "investments": round(investments, 2),
-            "debt": round(max(debt, 0), 2),
-            "net_worth": round(net_worth, 2)
-        })
+        timeline.append(
+            {
+                "month": month,
+                "income": round_money(
+                    effective_values.income
+                ),
+                "expenses": round_money(
+                    effective_values.expenses
+                ),
+                "debt_payment": round_money(
+                    debt_payment
+                ),
+                "investment_contribution": (
+                    round_money(
+                        investment_contribution
+                    )
+                ),
+                "monthly_surplus": round_money(
+                    monthly_surplus
+                ),
+                "cash_savings": round_money(
+                    cash
+                ),
+                "investment_value": round_money(
+                    investments
+                ),
+                "scenario_asset_value": (
+                    round_money(
+                        scenario_assets
+                    )
+                ),
+                "remaining_debt": round_money(
+                    remaining_debt
+                ),
+                "unfunded_deficit": round_money(
+                    unfunded_deficit
+                ),
+                "net_worth": round_money(
+                    net_worth
+                ),
+            }
+        )
+
+    final_month = timeline[-1]
+    goal = profile.financial_goal
+
+    if goal is None:
+        goal_reached = None
+    else:
+        goal_reached = (
+            final_month["net_worth"] >= goal
+        )
 
     return {
-        "type": "loan",
-
-        "scenario": {
-            "loan_amount": scenario.amount,
-            "interest_rate": scenario.interest_rate,
-            "duration_months": scenario.duration_months,
-            "emi": round(emi, 2),
-            "total_interest": round(total_interest, 2)
+        "timeline": timeline,
+        "final_summary": {
+            "final_cash_savings": (
+                final_month["cash_savings"]
+            ),
+            "final_investment_value": (
+                final_month["investment_value"]
+            ),
+            "final_scenario_asset_value": (
+                final_month[
+                    "scenario_asset_value"
+                ]
+            ),
+            "final_remaining_debt": (
+                final_month["remaining_debt"]
+            ),
+            "final_unfunded_deficit": (
+                final_month[
+                    "unfunded_deficit"
+                ]
+            ),
+            "final_net_worth": (
+                final_month["net_worth"]
+            ),
+            "total_debt_payments": (
+                round_money(
+                    total_debt_payments
+                )
+            ),
+            "total_interest_paid": (
+                round_money(
+                    total_interest_paid
+                )
+            ),
+            "goal": goal,
+            "goal_reached": goal_reached,
         },
-
-        "months": months,
-
-        "results": results,
-
-        "final_savings": round(savings, 2),
-        "final_investments": round(investments, 2),
-        "final_debt": round(max(debt, 0), 2),
-        "final_net_worth": round(
-            savings + investments - max(debt, 0),
-            2
-        )
     }
 
-
-# ============================================================
-# COMPARISON
-# ============================================================
 
 def compare_results(
     baseline: dict,
-    scenario: dict
+    scenario_result: dict,
 ) -> dict:
     """
-    Compare baseline and scenario results.
+    Return scenario minus baseline for every
+    important final value.
     """
 
-    return {
-        "savings_difference": round(
-            scenario["final_savings"]
-            - baseline["final_savings"],
-            2
-        ),
+    baseline_summary = (
+        baseline["final_summary"]
+    )
 
-        "investment_difference": round(
-            scenario["final_investments"]
-            - baseline["final_investments"],
-            2
-        ),
+    scenario_summary = (
+        scenario_result["final_summary"]
+    )
 
-        "debt_difference": round(
-            scenario["final_debt"]
-            - baseline["final_debt"],
-            2
-        ),
-
-        "net_worth_difference": round(
-            scenario["final_net_worth"]
-            - baseline["final_net_worth"],
-            2
+    def difference(field: str) -> float:
+        return round_money(
+            scenario_summary[field]
+            - baseline_summary[field]
         )
+
+    return {
+        "net_worth_difference": difference(
+            "final_net_worth"
+        ),
+        "savings_difference": difference(
+            "final_cash_savings"
+        ),
+        "investment_difference": difference(
+            "final_investment_value"
+        ),
+        "asset_difference": difference(
+            "final_scenario_asset_value"
+        ),
+        "debt_difference": difference(
+            "final_remaining_debt"
+        ),
+        "unfunded_deficit_difference": (
+            difference(
+                "final_unfunded_deficit"
+            )
+        ),
     }
-
-
-# ============================================================
-# MAIN TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    # Example user financial profile
-    profile = FinancialProfile(
-        monthly_income=100000,
-        monthly_expenses=45000,
-        savings=500000,
-        investments=300000,
-        monthly_investment=20000,
-        existing_debt=0
-    )
-
-    # Example scenario:
-    # ₹10 lakh loan, 9% interest, 5 years
-    loan = LoanScenario(
-        amount=1000000,
-        interest_rate=9,
-        duration_months=60
-    )
-
-    print("\n" + "=" * 60)
-    print("FINANCIAL DIGITAL TWIN - SIMULATION ENGINE")
-    print("=" * 60)
-
-    # -----------------------------------------
-    # Baseline
-    # -----------------------------------------
-
-    baseline = simulate_baseline(
-        profile,
-        months=60
-    )
-
-    # -----------------------------------------
-    # Loan scenario
-    # -----------------------------------------
-
-    scenario = simulate_loan(
-        profile,
-        loan,
-        months=60
-    )
-
-    # -----------------------------------------
-    # Comparison
-    # -----------------------------------------
-
-    comparison = compare_results(
-        baseline,
-        scenario
-    )
-
-    # -----------------------------------------
-    # Display
-    # -----------------------------------------
-
-    print("\nBASELINE")
-    print("-" * 60)
-
-    print(
-        f"Final Savings     : ₹{baseline['final_savings']:,.2f}"
-    )
-
-    print(
-        f"Final Investments : ₹{baseline['final_investments']:,.2f}"
-    )
-
-    print(
-        f"Final Debt        : ₹{baseline['final_debt']:,.2f}"
-    )
-
-    print(
-        f"Final Net Worth   : ₹{baseline['final_net_worth']:,.2f}"
-    )
-
-    print("\nLOAN SCENARIO")
-    print("-" * 60)
-
-    print(
-        f"Loan Amount       : ₹{loan.amount:,.2f}"
-    )
-
-    print(
-        f"Interest Rate     : {loan.interest_rate}%"
-    )
-
-    print(
-        f"Duration          : {loan.duration_months} months"
-    )
-
-    print(
-        f"Monthly EMI       : ₹{scenario['scenario']['emi']:,.2f}"
-    )
-
-    print(
-        f"Total Interest    : ₹{scenario['scenario']['total_interest']:,.2f}"
-    )
-
-    print(
-        f"Final Savings     : ₹{scenario['final_savings']:,.2f}"
-    )
-
-    print(
-        f"Final Investments : ₹{scenario['final_investments']:,.2f}"
-    )
-
-    print(
-        f"Final Debt        : ₹{scenario['final_debt']:,.2f}"
-    )
-
-    print(
-        f"Final Net Worth   : ₹{scenario['final_net_worth']:,.2f}"
-    )
-
-    print("\nDIFFERENCE")
-    print("-" * 60)
-
-    print(
-        f"Savings           : ₹{comparison['savings_difference']:,.2f}"
-    )
-
-    print(
-        f"Investments       : ₹{comparison['investment_difference']:,.2f}"
-    )
-
-    print(
-        f"Debt              : ₹{comparison['debt_difference']:,.2f}"
-    )
-
-    print(
-        f"Net Worth         : ₹{comparison['net_worth_difference']:,.2f}"
-    )
-
-    print("\nMONTH 1")
-    print("-" * 60)
-
-    print(scenario["results"][0])
-
-    print("\nMONTH 60")
-    print("-" * 60)
-
-    print(scenario["results"][-1])
-
-    print("\nSimulation completed successfully.")
