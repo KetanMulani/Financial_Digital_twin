@@ -3,267 +3,277 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.schemas.scenario import scenario_adapter
-from app.services.llm_service import llm_service
+from app.schemas.scenario_parse import LLMScenarioExtraction
+from app.services.llm_service import LLMService, llm_service
+
+
+class ScenarioParserError(ValueError):
+    """The provider output could not be interpreted safely."""
 
 
 SCENARIO_SYSTEM_PROMPT = """
-You are a financial scenario parser for a Financial Digital Twin.
+You convert one natural-language financial what-if request into JSON.
+You do not calculate projections, EMI, interest totals, or net worth.
+Never invent a financial amount, interest rate, duration, or percentage.
 
-Your job is ONLY to convert the user's natural-language
-financial "what-if" request into structured JSON.
-
-Do NOT:
-- calculate EMI
-- calculate loan interest
-- calculate net worth
-- perform financial projections
-- provide financial advice
-- invent missing financial values
-- invent loan interest rates
-- invent loan durations
-- invent purchase prices
-- invent income values
-
-The simulation engine performs all financial calculations.
-
-Supported scenario types:
+Supported scenario types and allowed fields:
 
 1. loan
+   type, amount, interest_rate, duration_months, start_month
+
 2. income_change
+   type, exactly one of amount or percentage, start_month
+   Use a negative value for a decrease.
+
 3. expense_change
+   type, exactly one of amount or percentage, start_month
+   Use a negative value for a decrease.
+
 4. investment_change
+   type, new_monthly_contribution, start_month
+
 5. purchase
+   type, price, down_payment, financed_amount, start_month
+   If financed_amount is greater than zero, also include interest_rate and
+   duration_months. down_payment + financed_amount must equal price.
+
 6. income_loss
+   type, start_month, duration_months, income_reduction
+   income_reduction is a percentage from greater than 0 through 100.
 
+Timing conversions:
+- immediately or now -> start_month 1
+- next month -> start_month 2
+- N years -> N multiplied by 12 months
 
-LOAN
-Required fields:
-- type
-- amount
-- interest_rate
-- duration_months
-- start_month
+Indian-number conversions:
+- 1 lakh -> 100000
+- 1 crore -> 10000000
 
-Example:
-"What if I take a 10 lakh loan for 5 years at 9 percent?"
+If timing is not stated, use start_month 1 and add this exact assumption:
+"No start time was provided; assumed month 1."
 
-Return:
+If any other required value is absent or ambiguous, omit it from scenario,
+list its exact field name in missing_fields, and set requires_clarification
+to true. Do not guess it.
 
+Return only one JSON object with exactly these top-level fields:
 {
-    "scenario": {
-        "type": "loan",
-        "amount": 1000000,
-        "interest_rate": 9,
-        "duration_months": 60,
-        "start_month": 1
-    },
-    "missing_fields": [],
-    "assumptions": [],
-    "requires_clarification": false
+  "scenario": {},
+  "missing_fields": [],
+  "assumptions": [],
+  "requires_clarification": false
 }
+""".strip()
 
 
-INCOME_CHANGE
-Required:
-- type
-- start_month
-- exactly one of amount or percentage
-
-Example:
-"What if my salary increases by 20000 starting next month?"
-
-Return:
-
-{
-    "scenario": {
-        "type": "income_change",
-        "amount": 20000,
-        "start_month": 2
-    },
-    "missing_fields": [],
-    "assumptions": [],
-    "requires_clarification": false
-}
-
-
-EXPENSE_CHANGE
-Required:
-- type
-- start_month
-- exactly one of amount or percentage
-
-
-INVESTMENT_CHANGE
-Required:
-- type
-- new_monthly_contribution
-- start_month
-
-
-PURCHASE
-Required:
-- type
-- price
-- down_payment
-- financed_amount
-- start_month
-
-The following must be true:
-
-down_payment + financed_amount = price
-
-
-INCOME_LOSS
-Required:
-- type
-- start_month
-- duration_months
-- income_reduction
-
-income_reduction is a percentage.
-
-
-IMPORTANT:
-
-If a required value is missing, DO NOT invent it.
-
-Return the available information and list the missing
-fields in "missing_fields".
-
-Set "requires_clarification" to true.
-
-For example:
-
-User:
-"What if I take a 10 lakh loan?"
-
-Return:
-
-{
-    "scenario": {
-        "type": "loan",
-        "amount": 1000000,
-        "start_month": 1
-    },
-    "missing_fields": [
+REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "loan": (
+        "amount",
         "interest_rate",
-        "duration_months"
-    ],
-    "assumptions": [],
-    "requires_clarification": true
+        "duration_months",
+        "start_month",
+    ),
+    "income_change": ("start_month",),
+    "expense_change": ("start_month",),
+    "investment_change": (
+        "new_monthly_contribution",
+        "start_month",
+    ),
+    "purchase": (
+        "price",
+        "down_payment",
+        "financed_amount",
+        "start_month",
+    ),
+    "income_loss": (
+        "start_month",
+        "duration_months",
+        "income_reduction",
+    ),
 }
 
 
-If the user clearly means the scenario starts immediately,
-use:
-
-"start_month": 1
-
-
-For "next month", use:
-
-"start_month": 2
-
-
-Convert common time expressions:
-
-1 year = 12 months
-2 years = 24 months
-3 years = 36 months
-5 years = 60 months
-
-
-Convert Indian currency expressions:
-
-10 lakh = 1000000
-5 lakh = 500000
-1 crore = 10000000
-
-
-Do not include fields that do not belong to the
-specific scenario type.
-
-Return ONLY valid JSON.
-
-The top-level response must have:
-
-{
-    "scenario": {},
-    "missing_fields": [],
-    "assumptions": [],
-    "requires_clarification": false
+QUESTION_TEXT = {
+    "type": "Which scenario do you want to model?",
+    "amount": "What amount should be used?",
+    "interest_rate": "What annual interest rate should be used?",
+    "duration_months": "What is the duration in months?",
+    "start_month": "In which simulation month should it begin?",
+    "amount_or_percentage": (
+        "Should the change use a fixed monthly amount or a percentage?"
+    ),
+    "new_monthly_contribution": (
+        "What should the new monthly investment contribution be?"
+    ),
+    "price": "What is the total purchase price?",
+    "down_payment": "What down payment will be made?",
+    "financed_amount": "How much of the purchase will be financed?",
+    "income_reduction": (
+        "What percentage of income will be lost?"
+    ),
+    "scenario": "Please clarify the financial scenario details.",
 }
-"""
 
 
-def parse_scenario(query: str) -> dict[str, Any]:
-    """
-    Convert natural-language financial input into
-    a validated structured scenario.
-    """
+def _unique_strings(values: list[Any]) -> list[str]:
+    result: list[str] = []
 
-    if not query or not query.strip():
-        raise ValueError(
-            "Scenario query cannot be empty."
+    for value in values:
+        if not isinstance(value, str):
+            continue
+
+        cleaned = value.strip()
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+
+    return result
+
+
+def _detect_missing_fields(
+    scenario_data: dict[str, Any],
+) -> list[str]:
+    scenario_type = scenario_data.get("type")
+
+    if scenario_type not in REQUIRED_FIELDS:
+        return ["type"]
+
+    missing = [
+        field
+        for field in REQUIRED_FIELDS[scenario_type]
+        if field not in scenario_data or scenario_data[field] is None
+    ]
+
+    if scenario_type in {"income_change", "expense_change"}:
+        has_amount = scenario_data.get("amount") is not None
+        has_percentage = scenario_data.get("percentage") is not None
+
+        if not has_amount and not has_percentage:
+            missing.append("amount_or_percentage")
+
+    if scenario_type == "purchase":
+        financed_amount = scenario_data.get("financed_amount")
+
+        if isinstance(financed_amount, (int, float)) and financed_amount > 0:
+            for field in ("interest_rate", "duration_months"):
+                if scenario_data.get(field) is None:
+                    missing.append(field)
+
+    return _unique_strings(missing)
+
+
+def _questions_for(fields: list[str]) -> list[str]:
+    return [
+        QUESTION_TEXT.get(
+            field,
+            f"Please provide a valid value for {field}.",
         )
+        for field in fields
+    ]
 
-    result = llm_service.generate_json(
+
+def _fields_from_validation_error(
+    error: ValidationError,
+) -> list[str]:
+    fields: list[str] = []
+
+    for item in error.errors(include_url=False):
+        location = item.get("loc", ())
+
+        field = "scenario"
+        if location:
+            candidate = str(location[-1])
+            if candidate not in REQUIRED_FIELDS:
+                field = candidate
+
+        if field not in fields:
+            fields.append(field)
+
+    return fields or ["scenario"]
+
+
+def parse_scenario(
+    query: str,
+    *,
+    client: LLMService | None = None,
+) -> dict[str, Any]:
+    """Convert natural language into a validated scenario or clarification."""
+
+    cleaned_query = query.strip() if isinstance(query, str) else ""
+
+    if not cleaned_query:
+        raise ScenarioParserError("Scenario query cannot be empty.")
+
+    provider = client or llm_service
+    raw_result = provider.generate_json(
         system_prompt=SCENARIO_SYSTEM_PROMPT,
-        user_prompt=query.strip(),
+        user_prompt=cleaned_query,
     )
 
-    if not isinstance(result, dict):
-        raise ValueError(
-            "LLM response must be a JSON object."
-        )
+    try:
+        extraction = LLMScenarioExtraction.model_validate(raw_result)
+    except ValidationError as exc:
+        raise ScenarioParserError(
+            "The LLM returned an invalid scenario response structure."
+        ) from exc
 
-    scenario_data = result.get("scenario")
+    scenario_data = dict(extraction.scenario)
+    assumptions = _unique_strings(extraction.assumptions)
 
-    if scenario_data is None:
-        raise ValueError(
-            "LLM response does not contain a scenario."
-        )
+    if scenario_data.get("type") in REQUIRED_FIELDS:
+        if scenario_data.get("start_month") is None:
+            scenario_data["start_month"] = 1
+            default_assumption = (
+                "No start time was provided; assumed month 1."
+            )
+            if default_assumption not in assumptions:
+                assumptions.append(default_assumption)
 
-    missing_fields = result.get(
-        "missing_fields",
-        []
+    detected_missing = _detect_missing_fields(scenario_data)
+    reported_missing = _unique_strings(extraction.missing_fields)
+    missing_fields = _unique_strings(
+        detected_missing + reported_missing
     )
 
-    assumptions = result.get(
-        "assumptions",
-        []
-    )
-
-    requires_clarification = result.get(
-        "requires_clarification",
-        False
-    )
-
-    # Missing information means we should not
-    # attempt Pydantic validation yet.
     if missing_fields:
         return {
+            "query": cleaned_query,
             "scenario": scenario_data,
             "missing_fields": missing_fields,
+            "clarification_questions": _questions_for(missing_fields),
             "assumptions": assumptions,
             "requires_clarification": True,
         }
 
-    # Validate the scenario against your exact
-    # discriminated Scenario union.
     try:
-        validated_scenario = scenario_adapter.validate_python(
-            scenario_data
-        )
-
+        validated_scenario = scenario_adapter.validate_python(scenario_data)
     except ValidationError as exc:
-        raise ValueError(
-            f"Invalid scenario returned by LLM: {exc}"
-        ) from exc
+        invalid_fields = _fields_from_validation_error(exc)
+
+        return {
+            "query": cleaned_query,
+            "scenario": scenario_data,
+            "missing_fields": invalid_fields,
+            "clarification_questions": _questions_for(invalid_fields),
+            "assumptions": assumptions,
+            "requires_clarification": True,
+        }
+
+    if extraction.requires_clarification:
+        return {
+            "query": cleaned_query,
+            "scenario": validated_scenario.model_dump(exclude_none=True),
+            "missing_fields": ["scenario"],
+            "clarification_questions": _questions_for(["scenario"]),
+            "assumptions": assumptions,
+            "requires_clarification": True,
+        }
 
     return {
-        "scenario": validated_scenario.model_dump(),
+        "query": cleaned_query,
+        "scenario": validated_scenario.model_dump(exclude_none=True),
         "missing_fields": [],
+        "clarification_questions": [],
         "assumptions": assumptions,
-        "requires_clarification": requires_clarification,
+        "requires_clarification": False,
     }
