@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./twin.db"
     frontend_origin: str = "http://localhost:5173"
 
-    llm_provider: str = "openai"
+    llm_provider: str = "gemini"
+    gemini_api_key: str | None = None
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
 
