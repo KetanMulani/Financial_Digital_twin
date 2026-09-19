@@ -14,10 +14,11 @@ class Settings(BaseSettings):
 
     # Natural-language scenario parser configuration.
     llm_provider: str = "gemini"
+    llm_fallback_provider: str | None = None
     llm_timeout_seconds: float = Field(default=30, gt=0, le=120)
 
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
 
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"

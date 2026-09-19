@@ -135,8 +135,10 @@ export interface SimulationResponse {
 }
 
 export interface ScenarioParseResult {
+  query: string;
   scenario: Scenario | Record<string, unknown>;
   missing_fields: string[];
+  clarification_questions: string[];
   assumptions: string[];
   requires_clarification: boolean;
 }

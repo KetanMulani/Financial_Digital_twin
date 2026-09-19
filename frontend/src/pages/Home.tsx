@@ -50,8 +50,8 @@ export function Home() {
 
       if (parsed.requires_clarification) {
         setAskNote(
-          parsed.missing_fields.length
-            ? `I need a bit more detail: ${parsed.missing_fields.join(", ")}.`
+          parsed.clarification_questions.length
+            ? parsed.clarification_questions.join(" ")
             : "I need a bit more detail to run that simulation."
         );
         return;

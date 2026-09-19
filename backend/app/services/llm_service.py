@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -15,10 +16,61 @@ class LLMProviderError(RuntimeError):
     """The configured provider failed or returned unusable output."""
 
 
+# Transient failures worth a short retry: rate limiting and the
+# provider's own server-side hiccups (Gemini in particular returns
+# 503 "model overloaded" fairly often under load).
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 0.6
+
+# A 429 can mean "briefly rate limited, retry shortly" (worth retrying)
+# or "quota exhausted for the day/billing period" (retrying is pointless
+# until the quota window resets or billing changes). Providers signal the
+# latter in the response body rather than with a distinct status code.
+_QUOTA_EXHAUSTED_MARKERS = ("resource_exhausted", "quota", "insufficient_quota")
+
+
+def _is_quota_exhausted(response: httpx.Response) -> bool:
+    try:
+        body = response.text.lower()
+    except Exception:
+        return False
+    return any(marker in body for marker in _QUOTA_EXHAUSTED_MARKERS)
+
+
 class LLMService:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         self.provider = self.settings.llm_provider.strip().lower()
+        fallback = (self.settings.llm_fallback_provider or "").strip().lower()
+        self.fallback_provider = fallback or None
+
+    def _generate_raw(
+        self,
+        provider: str,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        if provider == "gemini":
+            return self._generate_gemini(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+        if provider == "openai":
+            return self._generate_openai(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+        if provider == "anthropic":
+            return self._generate_anthropic(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+
+        raise LLMConfigurationError(
+            f"Unsupported LLM provider: {provider}"
+        )
 
     def generate_json(
         self,
@@ -26,66 +78,100 @@ class LLMService:
         system_prompt: str,
         user_prompt: str,
     ) -> dict[str, Any]:
-        if self.provider == "gemini":
-            content = self._generate_gemini(
+        try:
+            content = self._generate_raw(
+                self.provider,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
-        elif self.provider == "openai":
-            content = self._generate_openai(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-            )
-        elif self.provider == "anthropic":
-            content = self._generate_anthropic(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-            )
-        else:
-            raise LLMConfigurationError(
-                f"Unsupported LLM provider: {self.provider}"
-            )
+        except (LLMConfigurationError, LLMProviderError) as primary_error:
+            # The primary provider is unavailable (e.g. a sustained "model
+            # overloaded" outage that outlasts our retries). Fall back to a
+            # second configured provider rather than failing the request.
+            if (
+                self.fallback_provider is None
+                or self.fallback_provider == self.provider
+            ):
+                raise
+
+            try:
+                content = self._generate_raw(
+                    self.fallback_provider,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                )
+            except (LLMConfigurationError, LLMProviderError) as fallback_error:
+                raise LLMProviderError(
+                    f"{self.provider} failed ({primary_error}) and fallback "
+                    f"{self.fallback_provider} also failed ({fallback_error})."
+                ) from fallback_error
 
         return self._decode_json(content)
 
     def _post(
         self,
         *,
+        provider: str,
         url: str,
         headers: dict[str, str] | None = None,
         params: dict[str, str] | None = None,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        try:
-            response = httpx.post(
-                url,
-                headers=headers,
-                params=params,
-                json=payload,
-                timeout=self.settings.llm_timeout_seconds,
-            )
-            response.raise_for_status()
-            data = response.json()
-        except httpx.TimeoutException as exc:
-            raise LLMProviderError(
-                f"{self.provider} request timed out."
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            raise LLMProviderError(
-                f"{self.provider} returned HTTP "
-                f"{exc.response.status_code}."
-            ) from exc
-        except (httpx.RequestError, ValueError) as exc:
-            raise LLMProviderError(
-                f"Could not communicate with {self.provider}."
-            ) from exc
+        last_error: LLMProviderError | None = None
 
-        if not isinstance(data, dict):
-            raise LLMProviderError(
-                f"{self.provider} returned an invalid response."
-            )
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                response = httpx.post(
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=payload,
+                    timeout=self.settings.llm_timeout_seconds,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except httpx.TimeoutException as exc:
+                last_error = LLMProviderError(
+                    f"{provider} request timed out."
+                )
+                last_error.__cause__ = exc
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
 
-        return data
+                if status_code == 429 and _is_quota_exhausted(exc.response):
+                    last_error = LLMProviderError(
+                        f"{provider} quota is exhausted (429). Retrying "
+                        "won't help until the quota window resets or "
+                        "billing/plan limits are raised."
+                    )
+                    last_error.__cause__ = exc
+                    raise last_error from exc
+
+                last_error = LLMProviderError(
+                    f"{provider} returned HTTP {status_code}."
+                )
+                last_error.__cause__ = exc
+
+                if status_code not in _RETRYABLE_STATUS_CODES:
+                    raise last_error from exc
+            except (httpx.RequestError, ValueError) as exc:
+                last_error = LLMProviderError(
+                    f"Could not communicate with {provider}."
+                )
+                last_error.__cause__ = exc
+            else:
+                if not isinstance(data, dict):
+                    raise LLMProviderError(
+                        f"{provider} returned an invalid response."
+                    )
+
+                return data
+
+            if attempt < _MAX_ATTEMPTS:
+                time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+
+        assert last_error is not None
+        raise last_error
 
     def _generate_gemini(
         self,
@@ -107,6 +193,7 @@ class LLMService:
         )
 
         data = self._post(
+            provider="gemini",
             url=url,
             params={"key": api_key},
             payload={
@@ -147,6 +234,7 @@ class LLMService:
             )
 
         data = self._post(
+            provider="openai",
             url="https://api.openai.com/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -184,6 +272,7 @@ class LLMService:
             )
 
         data = self._post(
+            provider="anthropic",
             url="https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": api_key,
