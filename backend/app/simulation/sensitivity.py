@@ -1,327 +1,439 @@
-from copy import deepcopy
+from types import SimpleNamespace
 
-from .engine import (
-    FinancialProfile,
-    LoanScenario,
-    simulate_baseline,
-    simulate_loan,
+from app.schemas.scenario import Scenario
+from app.schemas.simulation import (
+    SensitivityConfig,
+    SensitivityParameter,
+    SimulationAssumptions,
+)
+from app.simulation.engine import (
+    project_finances,
+    round_money,
 )
 
 
-# ============================================================
-# INTEREST RATE SENSITIVITY
-# ============================================================
+PROFILE_PARAMETERS = {
+    "monthly_income",
+    "monthly_expenses",
+    "cash_savings",
+    "investments",
+    "monthly_investment",
+    "existing_debt",
+    "debt_interest_rate",
+    "monthly_debt_payment",
+}
 
-def sensitivity_interest_rate(
-    profile: FinancialProfile,
-    loan: LoanScenario,
-    rates: list[float],
-):
+
+ASSUMPTION_PARAMETERS = {
+    "annual_income_growth_rate",
+    "annual_expense_inflation_rate",
+    "annual_investment_return",
+    "annual_savings_interest_rate",
+}
+
+
+PROFILE_FIELDS = (
+    "monthly_income",
+    "monthly_expenses",
+    "cash_savings",
+    "investments",
+    "monthly_investment",
+    "existing_debt",
+    "debt_interest_rate",
+    "monthly_debt_payment",
+    "financial_goal",
+)
+
+
+NON_NEGATIVE_PARAMETERS = PROFILE_PARAMETERS
+
+
+# These match the limits used by the API schemas.
+RATE_LIMITS = {
+    "debt_interest_rate": (
+        0.0,
+        100.0,
+    ),
+    "annual_income_growth_rate": (
+        -100.0,
+        1000.0,
+    ),
+    "annual_expense_inflation_rate": (
+        -100.0,
+        1000.0,
+    ),
+    "annual_investment_return": (
+        -100.0,
+        1000.0,
+    ),
+    "annual_savings_interest_rate": (
+        -100.0,
+        1000.0,
+    ),
+}
+
+
+def _copy_profile(
+    profile,
+) -> SimpleNamespace:
     """
-    Test how different loan interest rates
-    affect the final financial outcome.
-    """
+    Copy only the profile fields required by the
+    projection engine.
 
-    results = []
-
-    for rate in rates:
-
-        scenario = deepcopy(loan)
-        scenario.interest_rate = rate
-
-        projection = simulate_loan(
-            profile,
-            scenario,
-            months=60,
-        )
-
-        results.append({
-            "parameter": "interest_rate",
-            "value": rate,
-            "final_net_worth": projection["final_net_worth"],
-            "final_savings": projection["final_savings"],
-            "final_investments": projection["final_investments"],
-            "final_debt": projection["final_debt"],
-            "emi": projection["scenario"]["emi"],
-            "total_interest": projection["scenario"]["total_interest"],
-        })
-
-    return results
-
-
-# ============================================================
-# MONTHLY EXPENSE SENSITIVITY
-# ============================================================
-
-def sensitivity_monthly_expenses(
-    profile: FinancialProfile,
-    expense_values: list[float],
-):
-    """
-    Test how different monthly expenses
-    affect the final financial outcome.
-    """
-
-    results = []
-
-    for expenses in expense_values:
-
-        test_profile = deepcopy(profile)
-        test_profile.monthly_expenses = expenses
-
-        projection = simulate_baseline(
-            test_profile,
-            months=60,
-        )
-
-        results.append({
-            "parameter": "monthly_expenses",
-            "value": expenses,
-            "final_net_worth": projection["final_net_worth"],
-            "final_savings": projection["final_savings"],
-            "final_investments": projection["final_investments"],
-        })
-
-    return results
-
-
-# ============================================================
-# MONTHLY INCOME SENSITIVITY
-# ============================================================
-
-def sensitivity_monthly_income(
-    profile: FinancialProfile,
-    income_values: list[float],
-):
-    """
-    Test how different monthly incomes
-    affect the final financial outcome.
+    This prevents sensitivity analysis from modifying
+    the stored SQLAlchemy profile.
     """
 
-    results = []
-
-    for income in income_values:
-
-        test_profile = deepcopy(profile)
-        test_profile.monthly_income = income
-
-        projection = simulate_baseline(
-            test_profile,
-            months=60,
-        )
-
-        results.append({
-            "parameter": "monthly_income",
-            "value": income,
-            "final_net_worth": projection["final_net_worth"],
-            "final_savings": projection["final_savings"],
-            "final_investments": projection["final_investments"],
-        })
-
-    return results
-
-
-# ============================================================
-# INVESTMENT RETURN SENSITIVITY
-# ============================================================
-
-def sensitivity_investment_return(
-    profile: FinancialProfile,
-    return_values: list[float],
-):
-    """
-    Test how different annual investment returns
-    affect the final financial outcome.
-    """
-
-    results = []
-
-    for annual_return in return_values:
-
-        projection = simulate_baseline(
-            profile,
-            months=60,
-            annual_investment_return=annual_return,
-        )
-
-        results.append({
-            "parameter": "investment_return",
-            "value": annual_return,
-            "final_net_worth": projection["final_net_worth"],
-            "final_savings": projection["final_savings"],
-            "final_investments": projection["final_investments"],
-        })
-
-    return results
-
-
-# ============================================================
-# INFLATION SENSITIVITY
-# ============================================================
-
-def sensitivity_inflation(
-    profile: FinancialProfile,
-    inflation_values: list[float],
-):
-    """
-    Test how different annual inflation rates
-    affect the final financial outcome.
-    """
-
-    results = []
-
-    for inflation in inflation_values:
-
-        projection = simulate_baseline(
-            profile,
-            months=60,
-            annual_inflation=inflation,
-        )
-
-        results.append({
-            "parameter": "inflation",
-            "value": inflation,
-            "final_net_worth": projection["final_net_worth"],
-            "final_savings": projection["final_savings"],
-            "final_investments": projection["final_investments"],
-        })
-
-    return results
-
-
-# ============================================================
-# MAIN TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    profile = FinancialProfile(
-        monthly_income=100000,
-        monthly_expenses=45000,
-        savings=500000,
-        investments=300000,
-        monthly_investment=20000,
-        existing_debt=0,
+    return SimpleNamespace(
+        **{
+            field: getattr(
+                profile,
+                field,
+            )
+            for field in PROFILE_FIELDS
+        }
     )
 
-    loan = LoanScenario(
-        amount=1000000,
-        interest_rate=9,
-        duration_months=60,
+
+def _bounded_value(
+    *,
+    parameter: SensitivityParameter,
+    value: float,
+) -> float:
+    """
+    Keep varied values within the same boundaries
+    enforced by the API schemas.
+    """
+
+    if parameter in NON_NEGATIVE_PARAMETERS:
+        value = max(
+            0.0,
+            value,
+        )
+
+    if parameter in RATE_LIMITS:
+        minimum, maximum = (
+            RATE_LIMITS[parameter]
+        )
+
+        value = min(
+            maximum,
+            max(
+                minimum,
+                value,
+            ),
+        )
+
+    return float(value)
+
+
+def _variation_values(
+    *,
+    parameter: SensitivityParameter,
+    base_value: float,
+    variation_percent: float,
+) -> tuple[float, float]:
+    """
+    Calculate the low and high test values.
+    """
+
+    variation = (
+        variation_percent / 100
     )
 
-    # --------------------------------------------------------
-    # Interest Rate
-    # --------------------------------------------------------
+    first_value = _bounded_value(
+        parameter=parameter,
+        value=(
+            base_value
+            * (1 - variation)
+        ),
+    )
 
-    print("\n--- Interest Rate Sensitivity ---")
+    second_value = _bounded_value(
+        parameter=parameter,
+        value=(
+            base_value
+            * (1 + variation)
+        ),
+    )
 
-    results = sensitivity_interest_rate(
-        profile,
-        loan,
-        rates=[7, 8, 9, 10, 11, 12],
+    return (
+        min(
+            first_value,
+            second_value,
+        ),
+        max(
+            first_value,
+            second_value,
+        ),
+    )
+
+
+def _run_with_parameter_value(
+    *,
+    profile,
+    assumptions: SimulationAssumptions,
+    projection_months: int,
+    scenario: Scenario | None,
+    parameter: SensitivityParameter,
+    value: float,
+) -> dict:
+    """
+    Run one projection with one modified input.
+    """
+
+    varied_profile = _copy_profile(
+        profile
+    )
+
+    varied_assumptions = (
+        assumptions.model_copy(
+            deep=True
+        )
+    )
+
+    if parameter in PROFILE_PARAMETERS:
+        setattr(
+            varied_profile,
+            parameter,
+            value,
+        )
+
+    elif parameter in ASSUMPTION_PARAMETERS:
+        setattr(
+            varied_assumptions,
+            parameter,
+            value,
+        )
+
+    else:
+        raise ValueError(
+            "Unsupported sensitivity parameter: "
+            f"{parameter}"
+        )
+
+    return project_finances(
+        profile=varied_profile,
+        assumptions=varied_assumptions,
+        projection_months=projection_months,
+        scenario=scenario,
+    )
+
+
+def run_sensitivity_analysis(
+    *,
+    profile,
+    assumptions: SimulationAssumptions,
+    projection_months: int,
+    config: SensitivityConfig,
+    scenario: Scenario | None = None,
+) -> dict:
+    """
+    Run one-at-a-time sensitivity analysis.
+
+    Each selected input is decreased and increased by
+    the configured percentage while all other inputs
+    remain unchanged.
+
+    Results are ranked by the range produced in final
+    net worth.
+    """
+
+    if projection_months < 1:
+        raise ValueError(
+            "projection_months must be at least 1."
+        )
+
+    base_projection = project_finances(
+        profile=profile,
+        assumptions=assumptions,
+        projection_months=projection_months,
+        scenario=scenario,
+    )
+
+    base_final_net_worth = (
+        base_projection[
+            "final_summary"
+        ][
+            "final_net_worth"
+        ]
+    )
+
+    results: list[dict] = []
+
+    for parameter in config.parameters:
+        if parameter in PROFILE_PARAMETERS:
+            base_value = float(
+                getattr(
+                    profile,
+                    parameter,
+                )
+            )
+
+        elif parameter in ASSUMPTION_PARAMETERS:
+            base_value = float(
+                getattr(
+                    assumptions,
+                    parameter,
+                )
+            )
+
+        else:
+            raise ValueError(
+                "Unsupported sensitivity parameter: "
+                f"{parameter}"
+            )
+
+        low_value, high_value = (
+            _variation_values(
+                parameter=parameter,
+                base_value=base_value,
+                variation_percent=(
+                    config.variation_percent
+                ),
+            )
+        )
+
+        low_projection = (
+            _run_with_parameter_value(
+                profile=profile,
+                assumptions=assumptions,
+                projection_months=(
+                    projection_months
+                ),
+                scenario=scenario,
+                parameter=parameter,
+                value=low_value,
+            )
+        )
+
+        high_projection = (
+            _run_with_parameter_value(
+                profile=profile,
+                assumptions=assumptions,
+                projection_months=(
+                    projection_months
+                ),
+                scenario=scenario,
+                parameter=parameter,
+                value=high_value,
+            )
+        )
+
+        low_final_net_worth = (
+            low_projection[
+                "final_summary"
+            ][
+                "final_net_worth"
+            ]
+        )
+
+        high_final_net_worth = (
+            high_projection[
+                "final_summary"
+            ][
+                "final_net_worth"
+            ]
+        )
+
+        results.append(
+            {
+                "parameter": parameter,
+                "base_value": round_money(
+                    base_value
+                ),
+                "low_value": round_money(
+                    low_value
+                ),
+                "high_value": round_money(
+                    high_value
+                ),
+                "base_final_net_worth": (
+                    round_money(
+                        base_final_net_worth
+                    )
+                ),
+                "low_final_net_worth": (
+                    round_money(
+                        low_final_net_worth
+                    )
+                ),
+                "high_final_net_worth": (
+                    round_money(
+                        high_final_net_worth
+                    )
+                ),
+                "low_change": round_money(
+                    low_final_net_worth
+                    - base_final_net_worth
+                ),
+                "high_change": round_money(
+                    high_final_net_worth
+                    - base_final_net_worth
+                ),
+                "net_worth_range": (
+                    round_money(
+                        abs(
+                            high_final_net_worth
+                            - low_final_net_worth
+                        )
+                    )
+                ),
+                "normalized_impact": 0.0,
+            }
+        )
+
+    maximum_range = max(
+        (
+            result[
+                "net_worth_range"
+            ]
+            for result in results
+        ),
+        default=0.0,
     )
 
     for result in results:
-        print(
-            f"{result['value']}% → "
-            f"EMI ₹{result['emi']:,.2f} → "
-            f"Net Worth ₹{result['final_net_worth']:,.2f}"
-        )
+        if maximum_range > 0:
+            result[
+                "normalized_impact"
+            ] = round_money(
+                result[
+                    "net_worth_range"
+                ]
+                / maximum_range
+                * 100
+            )
 
-    # --------------------------------------------------------
-    # Expenses
-    # --------------------------------------------------------
-
-    print("\n--- Monthly Expense Sensitivity ---")
-
-    results = sensitivity_monthly_expenses(
-        profile,
-        expense_values=[
-            30000,
-            35000,
-            40000,
-            45000,
-            50000,
-        ],
+    results.sort(
+        key=lambda result: (
+            result[
+                "net_worth_range"
+            ]
+        ),
+        reverse=True,
     )
 
-    for result in results:
-        print(
-            f"₹{result['value']:,.0f}/month → "
-            f"Net Worth ₹{result['final_net_worth']:,.2f}"
+    if results:
+        most_sensitive_parameter = (
+            results[0][
+                "parameter"
+            ]
         )
+    else:
+        most_sensitive_parameter = None
 
-    # --------------------------------------------------------
-    # Income
-    # --------------------------------------------------------
-
-    print("\n--- Monthly Income Sensitivity ---")
-
-    results = sensitivity_monthly_income(
-        profile,
-        income_values=[
-            70000,
-            80000,
-            90000,
-            100000,
-            110000,
-            120000,
-        ],
-    )
-
-    for result in results:
-        print(
-            f"₹{result['value']:,.0f}/month → "
-            f"Net Worth ₹{result['final_net_worth']:,.2f}"
-        )
-
-    # --------------------------------------------------------
-    # Investment Return
-    # --------------------------------------------------------
-
-    print("\n--- Investment Return Sensitivity ---")
-
-    results = sensitivity_investment_return(
-        profile,
-        return_values=[
-            0.04,
-            0.06,
-            0.08,
-            0.10,
-            0.12,
-            0.14,
-        ],
-    )
-
-    for result in results:
-        print(
-            f"{result['value'] * 100:.0f}% → "
-            f"Net Worth ₹{result['final_net_worth']:,.2f}"
-        )
-
-    # --------------------------------------------------------
-    # Inflation
-    # --------------------------------------------------------
-
-    print("\n--- Inflation Sensitivity ---")
-
-    results = sensitivity_inflation(
-        profile,
-        inflation_values=[
-            0.02,
-            0.03,
-            0.04,
-            0.05,
-            0.06,
-            0.07,
-        ],
-    )
-
-    for result in results:
-        print(
-            f"{result['value'] * 100:.0f}% → "
-            f"Net Worth ₹{result['final_net_worth']:,.2f}"
-        )
-
-    print("\nSensitivity analysis completed successfully.")
+    return {
+        "variation_percent": (
+            config.variation_percent
+        ),
+        "base_final_net_worth": (
+            round_money(
+                base_final_net_worth
+            )
+        ),
+        "ranking": results,
+        "most_sensitive_parameter": (
+            most_sensitive_parameter
+        ),
+    }

@@ -1,466 +1,406 @@
-# backend/app/simulation/monte_carlo.py
-
 import numpy as np
-from typing import Callable
 
-from .engine import (
-    FinancialProfile,
-    LoanScenario,
-    simulate_baseline,
-    simulate_loan,
+from app.schemas.scenario import Scenario
+from app.schemas.simulation import (
+    MonteCarloConfig,
+    SimulationAssumptions,
+)
+from app.simulation.engine import (
+    project_finances,
+    round_money,
 )
 
 
-# ============================================================
-# MONTE CARLO CONFIGURATION
-# ============================================================
-
-DEFAULT_SIMULATIONS = 1000
-
-# Expected annual investment return
-DEFAULT_RETURN_MEAN = 0.10
-
-# Standard deviation of annual investment return
-DEFAULT_RETURN_STD = 0.05
+# These bounds prevent impossible annual rates.
+# A return or growth rate cannot be below -100%.
+MIN_RATE = -100.0
+MAX_RATE = 100.0
 
 
-# ============================================================
-# MONTE CARLO - BASELINE
-# ============================================================
-
-def monte_carlo_baseline(
-    profile: FinancialProfile,
-    months: int = 60,
-    simulations: int = DEFAULT_SIMULATIONS,
-    return_mean: float = DEFAULT_RETURN_MEAN,
-    return_std: float = DEFAULT_RETURN_STD,
-    seed: int | None = 42,
+def _percentile_summary(
+    values: list[float],
 ) -> dict:
     """
-    Run Monte Carlo simulations for the user's baseline
-    financial situation.
-
-    Each simulation uses a different randomly generated
-    investment return.
-
-    Returns:
-        Summary statistics + all simulation results.
+    Convert a collection of simulation outputs into
+    chart-ready summary statistics.
     """
 
-    if simulations <= 0:
-        raise ValueError("Number of simulations must be greater than 0")
-
-    if months <= 0:
-        raise ValueError("Number of months must be greater than 0")
-
-    rng = np.random.default_rng(seed)
-
-    # Generate random annual returns
-    random_returns = rng.normal(
-        loc=return_mean,
-        scale=return_std,
-        size=simulations,
+    array = np.asarray(
+        values,
+        dtype=float,
     )
 
-    final_net_worths = []
-    final_savings = []
-    final_investments = []
-
-    simulation_results = []
-
-    for i, annual_return in enumerate(random_returns):
-
-        result = simulate_baseline(
-            profile=profile,
-            months=months,
-            annual_investment_return=float(annual_return),
-        )
-
-        final_net_worth = result["final_net_worth"]
-        savings = result["final_savings"]
-        investments = result["final_investments"]
-
-        final_net_worths.append(final_net_worth)
-        final_savings.append(savings)
-        final_investments.append(investments)
-
-        simulation_results.append({
-            "simulation": i + 1,
-            "annual_return": round(
-                float(annual_return) * 100,
-                2
-            ),
-            "final_net_worth": round(
-                final_net_worth,
-                2
-            ),
-            "final_savings": round(
-                savings,
-                2
-            ),
-            "final_investments": round(
-                investments,
-                2
-            ),
-        })
-
     return {
-        "type": "monte_carlo_baseline",
-
-        "simulations": simulations,
-
-        "months": months,
-
-        "assumptions": {
-            "return_mean": return_mean,
-            "return_std": return_std,
-        },
-
-        "summary": {
-            "p10": round(
-                float(np.percentile(final_net_worths, 10)),
-                2
-            ),
-            "p25": round(
-                float(np.percentile(final_net_worths, 25)),
-                2
-            ),
-            "p50": round(
-                float(np.percentile(final_net_worths, 50)),
-                2
-            ),
-            "p75": round(
-                float(np.percentile(final_net_worths, 75)),
-                2
-            ),
-            "p90": round(
-                float(np.percentile(final_net_worths, 90)),
-                2
-            ),
-            "mean": round(
-                float(np.mean(final_net_worths)),
-                2
-            ),
-            "minimum": round(
-                float(np.min(final_net_worths)),
-                2
-            ),
-            "maximum": round(
-                float(np.max(final_net_worths)),
-                2
-            ),
-        },
-
-        "all_results": simulation_results,
+        "p10": round_money(
+            np.percentile(array, 10)
+        ),
+        "p50": round_money(
+            np.percentile(array, 50)
+        ),
+        "p90": round_money(
+            np.percentile(array, 90)
+        ),
+        "mean": round_money(
+            np.mean(array)
+        ),
+        "minimum": round_money(
+            np.min(array)
+        ),
+        "maximum": round_money(
+            np.max(array)
+        ),
     }
 
 
-# ============================================================
-# MONTE CARLO - LOAN SCENARIO
-# ============================================================
-
-def monte_carlo_loan(
-    profile: FinancialProfile,
-    scenario: LoanScenario,
-    months: int = 60,
-    simulations: int = DEFAULT_SIMULATIONS,
-    return_mean: float = DEFAULT_RETURN_MEAN,
-    return_std: float = DEFAULT_RETURN_STD,
-    seed: int | None = 42,
-) -> dict:
+def _sample_rates(
+    *,
+    rng: np.random.Generator,
+    mean: float,
+    standard_deviation: float,
+    simulations: int,
+) -> np.ndarray:
     """
-    Run Monte Carlo simulations for a loan scenario.
+    Sample rates and clip them to valid bounds.
 
-    The loan itself remains deterministic.
-    Investment returns vary between simulations.
+    Rates are expressed in percentage points.
     """
 
-    if simulations <= 0:
-        raise ValueError("Number of simulations must be greater than 0")
-
-    if months <= 0:
-        raise ValueError("Number of months must be greater than 0")
-
-    rng = np.random.default_rng(seed)
-
-    random_returns = rng.normal(
-        loc=return_mean,
-        scale=return_std,
+    sampled_values = rng.normal(
+        loc=mean,
+        scale=standard_deviation,
         size=simulations,
     )
 
-    final_net_worths = []
-    final_savings = []
-    final_investments = []
+    return np.clip(
+        sampled_values,
+        MIN_RATE,
+        MAX_RATE,
+    )
 
-    simulation_results = []
 
-    for i, annual_return in enumerate(random_returns):
+def run_monte_carlo(
+    *,
+    profile,
+    base_assumptions: SimulationAssumptions,
+    projection_months: int,
+    config: MonteCarloConfig,
+    scenario: Scenario | None = None,
+) -> dict:
+    """
+    Run repeated projections using uncertain financial
+    assumptions.
 
-        result = simulate_loan(
+    The supplied scenario remains deterministic, while
+    investment return, income growth and expense
+    inflation vary between simulation paths.
+    """
+
+    if projection_months < 1:
+        raise ValueError(
+            "projection_months must be at least 1."
+        )
+
+    if config.simulations < 1:
+        raise ValueError(
+            "simulations must be at least 1."
+        )
+
+    rng = np.random.default_rng(
+        config.seed
+    )
+
+    investment_returns = _sample_rates(
+        rng=rng,
+        mean=(
+            base_assumptions
+            .annual_investment_return
+        ),
+        standard_deviation=(
+            config.investment_return_std
+        ),
+        simulations=config.simulations,
+    )
+
+    income_growth_rates = _sample_rates(
+        rng=rng,
+        mean=(
+            base_assumptions
+            .annual_income_growth_rate
+        ),
+        standard_deviation=(
+            config.income_growth_std
+        ),
+        simulations=config.simulations,
+    )
+
+    expense_inflation_rates = _sample_rates(
+        rng=rng,
+        mean=(
+            base_assumptions
+            .annual_expense_inflation_rate
+        ),
+        standard_deviation=(
+            config.expense_inflation_std
+        ),
+        simulations=config.simulations,
+    )
+
+    final_net_worths: list[float] = []
+    final_cash_savings: list[float] = []
+    final_investment_values: list[float] = []
+
+    goal_reached_count = 0
+    cash_depletion_count = 0
+    unfunded_deficit_count = 0
+
+    for simulation_index in range(
+        config.simulations
+    ):
+        sampled_assumptions = (
+            SimulationAssumptions(
+                annual_income_growth_rate=float(
+                    income_growth_rates[
+                        simulation_index
+                    ]
+                ),
+                annual_expense_inflation_rate=float(
+                    expense_inflation_rates[
+                        simulation_index
+                    ]
+                ),
+                annual_investment_return=float(
+                    investment_returns[
+                        simulation_index
+                    ]
+                ),
+                # Savings interest remains deterministic.
+                annual_savings_interest_rate=(
+                    base_assumptions
+                    .annual_savings_interest_rate
+                ),
+            )
+        )
+
+        projection = project_finances(
             profile=profile,
+            assumptions=sampled_assumptions,
+            projection_months=projection_months,
             scenario=scenario,
-            months=months,
-            annual_investment_return=float(annual_return),
         )
 
-        final_net_worth = result["final_net_worth"]
-        savings = result["final_savings"]
-        investments = result["final_investments"]
+        summary = projection[
+            "final_summary"
+        ]
 
-        final_net_worths.append(final_net_worth)
-        final_savings.append(savings)
-        final_investments.append(investments)
+        final_net_worths.append(
+            summary["final_net_worth"]
+        )
 
-        simulation_results.append({
-            "simulation": i + 1,
+        final_cash_savings.append(
+            summary["final_cash_savings"]
+        )
 
-            "annual_return": round(
-                float(annual_return) * 100,
-                2
-            ),
+        final_investment_values.append(
+            summary["final_investment_value"]
+        )
 
-            "final_net_worth": round(
-                final_net_worth,
-                2
-            ),
+        if summary["goal_reached"] is True:
+            goal_reached_count += 1
 
-            "final_savings": round(
-                savings,
-                2
-            ),
+        cash_was_depleted = any(
+            month["cash_savings"] <= 0
+            for month in projection["timeline"]
+        )
 
-            "final_investments": round(
-                investments,
-                2
-            ),
-        })
+        if cash_was_depleted:
+            cash_depletion_count += 1
+
+        if (
+            summary["final_unfunded_deficit"]
+            > 0
+        ):
+            unfunded_deficit_count += 1
+
+    probability_of_reaching_goal = None
+
+    if profile.financial_goal is not None:
+        probability_of_reaching_goal = (
+            round_money(
+                (
+                    goal_reached_count
+                    / config.simulations
+                )
+                * 100
+            )
+        )
+
+    probability_of_cash_depletion = (
+        round_money(
+            (
+                cash_depletion_count
+                / config.simulations
+            )
+            * 100
+        )
+    )
+
+    probability_of_unfunded_deficit = (
+        round_money(
+            (
+                unfunded_deficit_count
+                / config.simulations
+            )
+            * 100
+        )
+    )
 
     return {
-        "type": "monte_carlo_loan",
-
-        "scenario": {
-            "loan_amount": scenario.amount,
-            "interest_rate": scenario.interest_rate,
-            "duration_months": scenario.duration_months,
+        "simulations": config.simulations,
+        "seed": config.seed,
+        "final_net_worth": (
+            _percentile_summary(
+                final_net_worths
+            )
+        ),
+        "final_cash_savings": (
+            _percentile_summary(
+                final_cash_savings
+            )
+        ),
+        "final_investment_value": (
+            _percentile_summary(
+                final_investment_values
+            )
+        ),
+        "probability_of_reaching_goal": (
+            probability_of_reaching_goal
+        ),
+        "probability_of_cash_depletion": (
+            probability_of_cash_depletion
+        ),
+        "probability_of_unfunded_deficit": (
+            probability_of_unfunded_deficit
+        ),
+        "sampling_configuration": {
+            "annual_investment_return": {
+                "mean": (
+                    base_assumptions
+                    .annual_investment_return
+                ),
+                "standard_deviation": (
+                    config.investment_return_std
+                ),
+                "minimum": MIN_RATE,
+                "maximum": MAX_RATE,
+            },
+            "annual_income_growth_rate": {
+                "mean": (
+                    base_assumptions
+                    .annual_income_growth_rate
+                ),
+                "standard_deviation": (
+                    config.income_growth_std
+                ),
+                "minimum": MIN_RATE,
+                "maximum": MAX_RATE,
+            },
+            "annual_expense_inflation_rate": {
+                "mean": (
+                    base_assumptions
+                    .annual_expense_inflation_rate
+                ),
+                "standard_deviation": (
+                    config.expense_inflation_std
+                ),
+                "minimum": MIN_RATE,
+                "maximum": MAX_RATE,
+            },
         },
-
-        "simulations": simulations,
-
-        "months": months,
-
-        "assumptions": {
-            "return_mean": return_mean,
-            "return_std": return_std,
-        },
-
-        "summary": {
-            "p10": round(
-                float(np.percentile(final_net_worths, 10)),
-                2
-            ),
-
-            "p25": round(
-                float(np.percentile(final_net_worths, 25)),
-                2
-            ),
-
-            "p50": round(
-                float(np.percentile(final_net_worths, 50)),
-                2
-            ),
-
-            "p75": round(
-                float(np.percentile(final_net_worths, 75)),
-                2
-            ),
-
-            "p90": round(
-                float(np.percentile(final_net_worths, 90)),
-                2
-            ),
-
-            "mean": round(
-                float(np.mean(final_net_worths)),
-                2
-            ),
-
-            "minimum": round(
-                float(np.min(final_net_worths)),
-                2
-            ),
-
-            "maximum": round(
-                float(np.max(final_net_worths)),
-                2
-            ),
-        },
-
-        "all_results": simulation_results,
     }
 
-
-# ============================================================
-# COMPARE BASELINE VS SCENARIO
-# ============================================================
 
 def compare_monte_carlo(
     baseline_result: dict,
     scenario_result: dict,
 ) -> dict:
     """
-    Compare Monte Carlo distributions between
-    baseline and scenario.
+    Compare scenario percentiles and probabilities
+    against the baseline Monte Carlo result.
     """
 
-    baseline = baseline_result["summary"]
-    scenario = scenario_result["summary"]
+    baseline_net_worth = (
+        baseline_result["final_net_worth"]
+    )
+
+    scenario_net_worth = (
+        scenario_result["final_net_worth"]
+    )
+
+    baseline_goal_probability = (
+        baseline_result[
+            "probability_of_reaching_goal"
+        ]
+    )
+
+    scenario_goal_probability = (
+        scenario_result[
+            "probability_of_reaching_goal"
+        ]
+    )
+
+    if (
+        baseline_goal_probability is None
+        or scenario_goal_probability is None
+    ):
+        goal_probability_difference = None
+    else:
+        goal_probability_difference = (
+            round_money(
+                scenario_goal_probability
+                - baseline_goal_probability
+            )
+        )
 
     return {
-        "p10_difference": round(
-            scenario["p10"] - baseline["p10"],
-            2
+        "net_worth_p10_difference": (
+            round_money(
+                scenario_net_worth["p10"]
+                - baseline_net_worth["p10"]
+            )
         ),
-
-        "p25_difference": round(
-            scenario["p25"] - baseline["p25"],
-            2
+        "net_worth_p50_difference": (
+            round_money(
+                scenario_net_worth["p50"]
+                - baseline_net_worth["p50"]
+            )
         ),
-
-        "p50_difference": round(
-            scenario["p50"] - baseline["p50"],
-            2
+        "net_worth_p90_difference": (
+            round_money(
+                scenario_net_worth["p90"]
+                - baseline_net_worth["p90"]
+            )
         ),
-
-        "p75_difference": round(
-            scenario["p75"] - baseline["p75"],
-            2
+        "goal_probability_difference": (
+            goal_probability_difference
         ),
-
-        "p90_difference": round(
-            scenario["p90"] - baseline["p90"],
-            2
+        "cash_depletion_probability_difference": (
+            round_money(
+                scenario_result[
+                    "probability_of_cash_depletion"
+                ]
+                - baseline_result[
+                    "probability_of_cash_depletion"
+                ]
+            )
         ),
-
-        "mean_difference": round(
-            scenario["mean"] - baseline["mean"],
-            2
+        "unfunded_deficit_probability_difference": (
+            round_money(
+                scenario_result[
+                    "probability_of_unfunded_deficit"
+                ]
+                - baseline_result[
+                    "probability_of_unfunded_deficit"
+                ]
+            )
         ),
     }
-
-
-# ============================================================
-# SIMPLE TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    # Example financial profile
-    profile = FinancialProfile(
-        monthly_income=100000,
-        monthly_expenses=45000,
-        savings=500000,
-        investments=300000,
-        monthly_investment=20000,
-        existing_debt=0,
-    )
-
-    # Example ₹10 lakh loan
-    loan = LoanScenario(
-        amount=1000000,
-        interest_rate=9,
-        duration_months=60,
-    )
-
-    print("\n" + "=" * 60)
-    print("MONTE CARLO FINANCIAL SIMULATION")
-    print("=" * 60)
-
-    # --------------------------------------------------------
-    # Baseline
-    # --------------------------------------------------------
-
-    baseline = monte_carlo_baseline(
-        profile=profile,
-        months=60,
-        simulations=1000,
-    )
-
-    print("\nBASELINE - 1000 SIMULATIONS")
-    print("-" * 60)
-
-    print(
-        f"P10 Net Worth : ₹{baseline['summary']['p10']:,.2f}"
-    )
-
-    print(
-        f"P25 Net Worth : ₹{baseline['summary']['p25']:,.2f}"
-    )
-
-    print(
-        f"P50 Net Worth : ₹{baseline['summary']['p50']:,.2f}"
-    )
-
-    print(
-        f"P75 Net Worth : ₹{baseline['summary']['p75']:,.2f}"
-    )
-
-    print(
-        f"P90 Net Worth : ₹{baseline['summary']['p90']:,.2f}"
-    )
-
-    # --------------------------------------------------------
-    # Loan scenario
-    # --------------------------------------------------------
-
-    loan_result = monte_carlo_loan(
-        profile=profile,
-        scenario=loan,
-        months=60,
-        simulations=1000,
-    )
-
-    print("\nLOAN SCENARIO - 1000 SIMULATIONS")
-    print("-" * 60)
-
-    print(
-        f"P10 Net Worth : ₹{loan_result['summary']['p10']:,.2f}"
-    )
-
-    print(
-        f"P25 Net Worth : ₹{loan_result['summary']['p25']:,.2f}"
-    )
-
-    print(
-        f"P50 Net Worth : ₹{loan_result['summary']['p50']:,.2f}"
-    )
-
-    print(
-        f"P75 Net Worth : ₹{loan_result['summary']['p75']:,.2f}"
-    )
-
-    print(
-        f"P90 Net Worth : ₹{loan_result['summary']['p90']:,.2f}"
-    )
-
-    # --------------------------------------------------------
-    # Comparison
-    # --------------------------------------------------------
-
-    comparison = compare_monte_carlo(
-        baseline,
-        loan_result,
-    )
-
-    print("\nCOMPARISON")
-    print("-" * 60)
-
-    print(
-        f"P50 Difference : ₹{comparison['p50_difference']:,.2f}"
-    )
-
-    print(
-        f"Mean Difference: ₹{comparison['mean_difference']:,.2f}"
-    )
-
-    print("\nMonte Carlo simulation completed successfully.")
