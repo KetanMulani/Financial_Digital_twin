@@ -1,42 +1,112 @@
-from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field
 
-from pydantic import BaseModel, Field
+from app.schemas.scenario import Scenario
 
 
-class LoanScenarioRequest(BaseModel):
-    amount: float = Field(gt=0)
-    interest_rate: float = Field(ge=0)
-    duration_months: int = Field(gt=0)
+class SimulationAssumptions(BaseModel):
+    """
+    Annual rates are supplied as percentages.
+
+    Example:
+        10 means 10%
+        5 means 5%
+    """
+
+    annual_income_growth_rate: float = Field(
+        default=5,
+        ge=-100,
+        le=1000,
+    )
+
+    annual_expense_inflation_rate: float = Field(
+        default=5,
+        ge=-100,
+        le=1000,
+    )
+
+    annual_investment_return: float = Field(
+        default=10,
+        ge=-100,
+        le=1000,
+    )
+
+    annual_savings_interest_rate: float = Field(
+        default=3,
+        ge=-100,
+        le=1000,
+    )
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class SimulationRequest(BaseModel):
-    type: Literal["baseline", "loan"] = "baseline"
-
-    months: int = Field(default=60, gt=0, le=120)
-
-    annual_investment_return: float = Field(
-        default=0.10,
-        ge=-1,
+    projection_months: int = Field(
+        default=60,
+        ge=1,
+        le=600,
     )
 
-    annual_inflation: float = Field(
-        default=0.05,
-        ge=-1,
+    assumptions: SimulationAssumptions = Field(
+        default_factory=SimulationAssumptions
     )
 
-    loan: LoanScenarioRequest | None = None
+    scenario: Scenario | None = None
 
-    monte_carlo: bool = False
+    model_config = ConfigDict(extra="forbid")
 
-    simulations: int = Field(
-        default=1000,
-        gt=0,
-        le=10000,
-    )
+
+class TimelinePoint(BaseModel):
+    month: int
+
+    income: float
+    expenses: float
+    debt_payment: float
+    investment_contribution: float
+    monthly_surplus: float
+
+    cash_savings: float
+    investment_value: float
+    scenario_asset_value: float
+
+    remaining_debt: float
+    unfunded_deficit: float
+    net_worth: float
+
+
+class FinalSummary(BaseModel):
+    final_cash_savings: float
+    final_investment_value: float
+    final_scenario_asset_value: float
+
+    final_remaining_debt: float
+    final_unfunded_deficit: float
+    final_net_worth: float
+
+    total_debt_payments: float
+    total_interest_paid: float
+
+    goal: float | None
+    goal_reached: bool | None
+
+
+class ProjectionResult(BaseModel):
+    timeline: list[TimelinePoint]
+    final_summary: FinalSummary
+
+
+class SimulationComparison(BaseModel):
+    net_worth_difference: float
+    savings_difference: float
+    investment_difference: float
+    asset_difference: float
+    debt_difference: float
+    unfunded_deficit_difference: float
 
 
 class SimulationResponse(BaseModel):
-    baseline: dict
-    scenario: dict | None = None
-    comparison: dict | None = None
-    monte_carlo: dict | None = None
+    baseline: ProjectionResult
+    scenario: ProjectionResult | None = None
+    comparison: SimulationComparison | None = None
+
+    warnings: list[str]
+    assumptions_used: SimulationAssumptions
